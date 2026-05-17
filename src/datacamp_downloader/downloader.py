@@ -42,9 +42,22 @@ def login(
 
 
 @app.command()
-def set_token(token: str = typer.Argument(...)):
+def set_token(
+    token: Optional[str] = typer.Argument(
+        None,
+        help="Datacamp _dct cookie value. Falls back to TOKEN in .env or environment.",
+    ),
+):
     """Log in to Datacamp using your token."""
-    datacamp.set_token(token)
+    from .env import get_token_from_env
+
+    resolved = (token or get_token_from_env() or "").strip()
+    if not resolved:
+        Logger.error(
+            "No token provided. Pass it as an argument or set TOKEN in a .env file."
+        )
+        raise typer.Exit(code=1)
+    datacamp.set_token(resolved)
 
 
 @app.command()

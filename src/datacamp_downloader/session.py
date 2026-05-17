@@ -1,12 +1,8 @@
-import json
 import os
 import pickle
-import json
-from webdriver_manager.chrome import ChromeDriverManager
-import re
-from bs4 import BeautifulSoup
-import os
 from pathlib import Path
+
+from webdriver_manager.chrome import ChromeDriverManager
 
 # Prefer top-level undetected_chromedriver (works with Selenium 4); fallback to v2.
 try:
@@ -14,10 +10,9 @@ try:
 except Exception:
     import undetected_chromedriver.v2 as uc
 
-# Selenium helper imports (we use these to create Service/options safely)
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
@@ -25,6 +20,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from .constants import HOME_PAGE, SESSION_FILE
 from .datacamp_utils import Datacamp
+from .json_fetch import JsonFetchError, extract_json_text, parse_json_response
 
 
 class Session:
@@ -47,8 +43,14 @@ class Session:
     def reset(self):
         try:
             os.remove(SESSION_FILE)
-        except:
+        except OSError:
             pass
+        if hasattr(self, "driver"):
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            del self.driver
 
     def _setup_driver(self, headless=True):
         try:
@@ -62,7 +64,6 @@ class Session:
             if headless:
                 options.add_argument("--headless=new")
 
-        # existing flags...
         options.add_argument("--no-first-run")
         options.add_argument("--no-service-autorun")
         options.add_argument("--password-store=basic")
@@ -79,29 +80,36 @@ class Session:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
 
-        # get the absolute path of the installed package
         package_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # create a chrome profile folder inside the package directory
         profile_dir = os.path.join(package_dir, "dc_chrome_profile")
-
-        # make sure it exists
         os.makedirs(profile_dir, exist_ok=True)
-
-        # tell Chrome to use it
         options.add_argument(f"--user-data-dir={profile_dir}")
-
 
         service = ChromeService(executable_path=ChromeDriverManager().install())
         try:
             self.driver = uc.Chrome(service=service, options=options)
-            return
         except Exception:
             self.driver = webdriver.Chrome(service=service, options=options)
 
+        self.driver.set_script_timeout(60)
+
+    def _ensure_on_datacamp(self):
+        if "datacamp.com" not in (self.driver.current_url or ""):
+            self.driver.get(HOME_PAGE)
+            self.bypass_cloudflare(HOME_PAGE)
+
     def start(self, headless=False):
         if hasattr(self, "driver"):
-            return
+            try:
+                _ = self.driver.current_url
+            except Exception:
+                del self.driver
+            else:
+                if self.datacamp.token:
+                    self._ensure_on_datacamp()
+                    self.add_token(self.datacamp.token)
+                return
+
         self._setup_driver(headless)
         self.driver.get(HOME_PAGE)
         self.bypass_cloudflare(HOME_PAGE)
@@ -111,9 +119,8 @@ class Session:
     def bypass_cloudflare(self, url):
         try:
             self.get_element_by_id("cf-spinner-allow-5-secs")
-            with self.driver:
-                self.driver.get(url)
-        except:
+            self.driver.get(url)
+        except Exception:
             pass
 
     def get(self, url):
@@ -122,27 +129,75 @@ class Session:
         self.bypass_cloudflare(url)
         return self.driver.page_source
 
+    def _fetch_via_browser(self, url: str) -> str:
+        self.start()
+        self._ensure_on_datacamp()
 
+        result = self.driver.execute_async_script(
+            """
+            const url = arguments[0];
+            const done = arguments[arguments.length - 1];
+            fetch(url, {
+                credentials: 'include',
+                headers: { Accept: 'application/json' },
+            })
+            .then(async (response) => {
+                const body = await response.text();
+                done({
+                    ok: response.ok,
+                    status: response.status,
+                    contentType: response.headers.get('content-type') || '',
+                    body: body,
+                });
+            })
+            .catch((err) => done({ ok: false, status: 0, body: '', error: String(err) }));
+            """,
+            url,
+        )
 
-    def get_json(self, url):
-        page = self.get(url).strip()
+        if not result:
+            raise JsonFetchError("Browser fetch returned no result.", url=url)
 
-        # Parse with BeautifulSoup
-        soup = BeautifulSoup(page, "html.parser")
-        pre = soup.find("pre")
+        if result.get("error"):
+            raise JsonFetchError(
+                f"Browser fetch failed: {result['error']}",
+                url=url,
+            )
 
-        if pre:
-            page = pre.text  # ✅ grab only the JSON inside <pre>
-        else:
-            page = page  # maybe raw JSON already
+        status = result.get("status", 0)
+        body = (result.get("body") or "").strip()
+        if status >= 400 or not body:
+            raise JsonFetchError(
+                f"HTTP {status} with empty or error body.",
+                url=url,
+                preview=body[:500],
+            )
 
-        # Debug
-        #print("\n\n[DEBUG get_json cleaned] First 200 chars:\n", page[:200], "\n\n")
+        return body
 
-        return json.loads(page)
+    def get_json(self, url: str):
+        """Load JSON from a DataCamp API URL (navigation first, then in-page fetch)."""
+        errors = []
+
+        # Navigate in Chrome first so Cloudflare and cookies apply (fetch alone often 403s).
+        try:
+            page = self.get(url).strip()
+            return parse_json_response(extract_json_text(page), url=url)
+        except JsonFetchError as exc:
+            errors.append(str(exc))
+
+        try:
+            return parse_json_response(self._fetch_via_browser(url), url=url)
+        except JsonFetchError as exc:
+            errors.append(str(exc))
+
+        raise JsonFetchError(
+            "Could not load JSON from DataCamp. " + " | ".join(errors),
+            url=url,
+        )
 
     def to_json(self, page: str):
-        return json.loads(page)
+        return parse_json_response(page)
 
     def get_element_by_id(self, id: str) -> WebElement:
         return self.driver.find_element(By.ID, id)
@@ -159,6 +214,10 @@ class Session:
         )
 
     def add_token(self, token: str):
+        self._ensure_on_datacamp()
+        existing = self.driver.get_cookie("_dct")
+        if existing and existing.get("value") == token:
+            return self
         cookie = {
             "name": "_dct",
             "value": token,
@@ -166,4 +225,5 @@ class Session:
             "secure": True,
         }
         self.driver.add_cookie(cookie)
+        self.driver.refresh()
         return self

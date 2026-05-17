@@ -103,6 +103,7 @@ celerybeat.pid
 
 # Environments
 .env
+src/datacamp_downloader/dc_chrome_profile/
 .venv
 env/
 venv/

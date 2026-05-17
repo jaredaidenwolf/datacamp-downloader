@@ -1,5 +1,6 @@
 import re
 import sys
+import time
 from pathlib import Path
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -32,6 +33,7 @@ from .helper import (
     print_progress,
     save_text,
 )
+from .json_fetch import JsonFetchError
 from .templates.course import Chapter, Course
 from .templates.exercise import Exercise
 from .templates.track import Track
@@ -44,8 +46,11 @@ def login_required(f):
         if not isinstance(self, Datacamp):
             Logger.error(f"{login_required.__name__} can only decorate Datacamp class.")
             return
+        self.ensure_env_token()
         if not self.loggedin:
-            Logger.error("Login first!")
+            Logger.error(
+                "Login first! Run `datacamp set-token` or set TOKEN in a .env file."
+            )
             return
         return f(*args, **kwargs)
 
@@ -63,6 +68,8 @@ def try_except_request(f):
 
         try:
             return f(*args, **kwargs)
+        except JsonFetchError as e:
+            Logger.error(str(e))
         except Exception as e:
             if str(e):
                 Logger.error(e)
@@ -91,6 +98,23 @@ class Datacamp:
 
         self.not_found_courses = set()
 
+    def ensure_env_token(self):
+        from .env import get_token_from_env
+
+        token = get_token_from_env()
+        if token and not self.loggedin:
+            self.set_token(token)
+
+    def _profile_slug(self):
+        if not self.login_data:
+            raise JsonFetchError("Not logged in — no profile slug available.")
+        for key in ("slug", "username", "profile_slug"):
+            slug = self.login_data.get(key)
+            if slug:
+                return slug
+        raise JsonFetchError(
+            "No profile slug in login data. Try `datacamp reset` and log in again."
+        )
 
     @animate_wait
     @try_except_request
@@ -245,13 +269,27 @@ class Datacamp:
         self.session.add_token(token)
         self._set_profile()
 
-    def get_profile_data(self):
-        if not self.profile_data:
-            self.profile_data = self.session.get_json(
-                PROFILE_DATA_URL.format(slug=self.login_data["slug"])
-            )
-            self.session.driver.minimize_window()
-        return self.profile_data
+    def get_profile_data(self, refresh=False, retries=3):
+        if self.profile_data and not refresh:
+            return self.profile_data
+
+        slug = self._profile_slug()
+        url = PROFILE_DATA_URL.format(slug=slug)
+        last_error = None
+        for attempt in range(retries):
+            try:
+                self.profile_data = self.session.get_json(url)
+                if hasattr(self.session, "driver"):
+                    try:
+                        self.session.driver.minimize_window()
+                    except Exception:
+                        pass
+                return self.profile_data
+            except JsonFetchError as exc:
+                last_error = exc
+                if attempt < retries - 1:
+                    time.sleep(2)
+        raise last_error
 
     @login_required
     @animate_wait
@@ -475,7 +513,7 @@ class Datacamp:
 
         self.tracks = []
 
-        data = self.get_profile_data()
+        data = self.get_profile_data(refresh=refresh)
         completed_tracks = data["completed_tracks"]
         for i, track in enumerate(completed_tracks, 1):
             self.tracks.append(Track(f"t{i}", track["title"].strip(), track["url"]))
@@ -503,7 +541,7 @@ class Datacamp:
 
         self.courses = []
 
-        data = self.get_profile_data()
+        data = self.get_profile_data(refresh=refresh)
         completed_courses = data["completed_courses"]
         for course in completed_courses:
             fetched_course = self.get_course(course["id"])
@@ -575,7 +613,7 @@ class Datacamp:
     def _set_profile(self):
         try:
             data = self.session.get_json(LOGIN_DETAILS_URL)
-        except Exception as e:
+        except JsonFetchError:
             Logger.error("Incorrect input token!")
             return
 
@@ -593,10 +631,19 @@ class Datacamp:
         else:
             Logger.warning("No active subscription found")
 
-        self.loggedin = True
         self.login_data = data
         self.has_active_subscription = has_sub
 
+        try:
+            self.get_profile_data(refresh=True)
+        except JsonFetchError as e:
+            self.loggedin = False
+            self.login_data = None
+            self.profile_data = None
+            Logger.error(str(e))
+            return
+
+        self.loggedin = True
         self.session.save()
 
     def _get_subtitle(self, sub, video: Video):
